@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import atexit
+import ctypes
 import json
 import logging
 import queue
@@ -79,6 +81,7 @@ DEFAULT_CONFIG = {
     "hotkey_name": "左 Option",
     "auto_enter": False,
     "restore_clipboard": True,
+    "mute_audio": True,
     "model": "models/Qwen3-ASR-0.6B",
     "device": None,
     "max_record_seconds": 60,
@@ -184,6 +187,18 @@ def strip_context_echo(text: str, context: str) -> str:
     return text
 
 
+def to_simplified(text: str) -> str:
+    """模型偶尔会输出繁体（流式解码更常见），统一转成简体。"""
+    if not text:
+        return text
+    try:
+        return NSString.stringWithString_(text).stringByApplyingTransform_reverse_(
+            "Traditional-Simplified", False
+        )
+    except Exception:  # noqa: BLE001
+        return text
+
+
 def key_name(keycode: int) -> str:
     if keycode in MODIFIER_KEYS:
         return MODIFIER_KEYS[keycode][0]
@@ -238,6 +253,124 @@ def play_sound(name: str) -> None:
         NSSound.soundNamed_(name).play()
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---------------------------------------------------------------------------
+# 系统输出静音
+# ---------------------------------------------------------------------------
+
+class AudioSilencer:
+    """录音时静音默认输出设备，结束后恢复成原来的状态。
+
+    用 CoreAudio 公共 API，不依赖具体播放器：汽水、网易云、Chrome、视频
+    都能一并静音。音乐只是听不见，并不会暂停。
+    """
+
+    _SYS = 1
+    _GLOBAL = 0x676C6F62       # 'glob'
+    _OUTPUT = 0x6F757470       # 'outp'
+    _DEFAULT_OUT = 0x644F7574  # 'dOut'
+    _MUTE = 0x6D757465         # 'mute'
+
+    class _Addr(ctypes.Structure):
+        _fields_ = [
+            ("selector", ctypes.c_uint32),
+            ("scope", ctypes.c_uint32),
+            ("element", ctypes.c_uint32),
+        ]
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._device = None
+        self._was_muted = False
+        self._ca = None
+        try:
+            ca = ctypes.CDLL(
+                "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
+            )
+            ca.AudioObjectGetPropertyData.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(self._Addr),
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_void_p,
+            ]
+            ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
+            ca.AudioObjectSetPropertyData.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(self._Addr),
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            ]
+            ca.AudioObjectSetPropertyData.restype = ctypes.c_int32
+            self._ca = ca
+        except Exception:  # noqa: BLE001
+            logging.exception("加载 CoreAudio 失败，静音功能不可用")
+
+    def _addr(self, selector: int, scope: int) -> "AudioSilencer._Addr":
+        return self._Addr(selector, scope, 0)
+
+    def _default_device(self) -> int | None:
+        value = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(value))
+        addr = self._addr(self._DEFAULT_OUT, self._GLOBAL)
+        status = self._ca.AudioObjectGetPropertyData(
+            self._SYS, ctypes.byref(addr), 0, None, ctypes.byref(size),
+            ctypes.byref(value),
+        )
+        return value.value if status == 0 else None
+
+    def _get_mute(self, device: int) -> int | None:
+        value = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(value))
+        addr = self._addr(self._MUTE, self._OUTPUT)
+        status = self._ca.AudioObjectGetPropertyData(
+            device, ctypes.byref(addr), 0, None, ctypes.byref(size),
+            ctypes.byref(value),
+        )
+        return value.value if status == 0 else None
+
+    def _set_mute(self, device: int, muted: bool) -> bool:
+        value = ctypes.c_uint32(1 if muted else 0)
+        addr = self._addr(self._MUTE, self._OUTPUT)
+        status = self._ca.AudioObjectSetPropertyData(
+            device, ctypes.byref(addr), 0, None, ctypes.sizeof(value),
+            ctypes.byref(value),
+        )
+        return status == 0
+
+    def mute(self) -> bool:
+        """静音默认输出设备；已静音则什么都不做。"""
+        if self._ca is None:
+            return False
+        with self._lock:
+            if self._device is not None:
+                return False
+            device = self._default_device()
+            if device is None:
+                logging.warning("取不到默认输出设备，无法静音")
+                return False
+            previous = self._get_mute(device)
+            if previous is None or not self._set_mute(device, True):
+                logging.warning("默认输出设备不支持静音")
+                return False
+            self._device = device
+            self._was_muted = bool(previous)
+            return True
+
+    def restore(self) -> bool:
+        """把设备恢复到录音前的静音状态。"""
+        if self._ca is None:
+            return False
+        with self._lock:
+            if self._device is None:
+                return False
+            self._set_mute(self._device, self._was_muted)
+            self._device = None
+            return True
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +825,10 @@ class DictateApp(rumps.App):
         self.recorder.on_block = self._on_audio_block
         self.transcribe_lock = threading.Lock()
         self.record_timer = None
+        self.silencer = AudioSilencer()
+        self.mute_timer = None
+        self.silence_gen = 0
+        atexit.register(self.silencer.restore)
 
         self.hud = HUD()
         self.hud_gen = 0
@@ -715,6 +852,10 @@ class DictateApp(rumps.App):
             "粘贴后恢复剪贴板", callback=self.toggle_restore
         )
         self.restore_item.state = 1 if cfg.get("restore_clipboard") else 0
+        self.mute_item = rumps.MenuItem(
+            "听写时静音其他声音", callback=self.toggle_mute
+        )
+        self.mute_item.state = 1 if cfg.get("mute_audio", True) else 0
 
         self.menu = [
             self.status_item,
@@ -724,6 +865,7 @@ class DictateApp(rumps.App):
             None,
             self.auto_enter_item,
             self.restore_item,
+            self.mute_item,
             None,
             rumps.MenuItem("检查权限…", callback=self.check_permissions),
             rumps.MenuItem("测试悬浮窗", callback=self.test_hud),
@@ -909,8 +1051,36 @@ class DictateApp(rumps.App):
                     )
                     return
                 pending = pending[chunk_len:]
-                text = strip_context_echo(state.text, self.context)
+                text = to_simplified(
+                    strip_context_echo(state.text, self.context)
+                )
                 ui_thread(lambda t=text: self.hud.set_text(t))
+
+    # -- 系统静音 -----------------------------------------------------------
+    def _silence_later(self) -> None:
+        """录音开始时静音输出；等 Tink 播完再静音，免得把提示音切掉。"""
+        if not self.cfg.get("mute_audio", True):
+            return
+        self.silence_gen += 1
+        gen = self.silence_gen
+        self.mute_timer = threading.Timer(0.6, lambda: self._silence_now(gen))
+        self.mute_timer.daemon = True
+        self.mute_timer.start()
+
+    def _silence_now(self, gen: int) -> None:
+        if gen != self.silence_gen:
+            return  # 录音已经结束，别把声音又静音了
+        self.mute_timer = None
+        if self.silencer.mute():
+            logging.info("系统输出已静音")
+
+    def _unsilence(self) -> None:
+        self.silence_gen += 1
+        if self.mute_timer is not None:
+            self.mute_timer.cancel()
+            self.mute_timer = None
+        if self.silencer.restore():
+            logging.info("系统输出已恢复")
 
     # -- 热键 ---------------------------------------------------------------
     def on_hotkey_press(self) -> None:
@@ -934,6 +1104,7 @@ class DictateApp(rumps.App):
             self._error(f"录音失败：{exc}")
             return
         play_sound("Tink")
+        self._silence_later()
         self._set_state("recording", "录音中…松开结束")
         max_sec = float(self.cfg.get("max_record_seconds", 60))
         self.record_timer = threading.Timer(max_sec, self.on_hotkey_release)
@@ -943,6 +1114,7 @@ class DictateApp(rumps.App):
     def on_hotkey_release(self) -> None:
         if self.state != "recording":
             return
+        self._unsilence()
         if self.record_timer is not None:
             self.record_timer.cancel()
             self.record_timer = None
@@ -969,6 +1141,7 @@ class DictateApp(rumps.App):
     def on_cancel(self) -> None:
         if self.state != "recording":
             return
+        self._unsilence()
         if self.record_timer is not None:
             self.record_timer.cancel()
             self.record_timer = None
@@ -1001,8 +1174,10 @@ class DictateApp(rumps.App):
                 result = self.session.transcribe(
                     pcm, context=self.context, verbose=False
                 )
-                text = strip_context_echo(
-                    getattr(result, "text", "") or "", self.context
+                text = to_simplified(
+                    strip_context_echo(
+                        getattr(result, "text", "") or "", self.context
+                    )
                 )
             except Exception as exc:  # noqa: BLE001
                 logging.exception("识别失败")
@@ -1046,6 +1221,13 @@ class DictateApp(rumps.App):
         sender.state = 1 if self.cfg["restore_clipboard"] else 0
         save_config(self.cfg)
 
+    def toggle_mute(self, sender) -> None:
+        self.cfg["mute_audio"] = not bool(self.cfg.get("mute_audio", True))
+        sender.state = 1 if self.cfg["mute_audio"] else 0
+        save_config(self.cfg)
+        if not self.cfg["mute_audio"]:
+            self._unsilence()
+
     def test_hud(self, _sender) -> None:
         self.hud_gen += 1
         gen = self.hud_gen
@@ -1080,6 +1262,7 @@ class DictateApp(rumps.App):
         subprocess.Popen(["open", "-e", str(LOG_FILE)])
 
     def quit(self, _sender) -> None:
+        self._unsilence()
         rumps.quit_application()
 
 

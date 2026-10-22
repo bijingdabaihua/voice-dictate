@@ -1,0 +1,8 @@
+.venv/
+models/
+logs/
+dictation.json
+Dictate.app/
+__pycache__/
+*.pyc
+.DS_Store

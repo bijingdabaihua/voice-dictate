@@ -1,0 +1,8 @@
+# 每行一个热词 / 专有名词，会作为 context 传给 Qwen3-ASR。
+#
+# 注意：不是越多越好。只放「模型容易听错」的专有名词；
+# Python / API / GitHub 这类常见词模型本来就认识，加多了反而会干扰
+# 流式解码（实测长列表会让 debug 被识别成「开发」）。
+Claude Code
+cc-connect
+MCP

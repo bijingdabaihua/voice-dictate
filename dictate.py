@@ -2,7 +2,7 @@
 """Qwen3-ASR 全局听写（菜单栏 App）
 
 按住热键说话，松开后自动识别并粘贴到当前光标处。
-默认热键：右 Option（Windows 键盘上的右 Alt）。
+默认热键：左 Option（Windows 键盘上的左 Alt）。
 
 首次运行需要授权：
   1. 麦克风
@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import queue
@@ -21,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import numpy as np
@@ -69,13 +69,14 @@ except Exception as exc:  # noqa: BLE001
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "dictation.json"
+HOTWORDS_FILE = ROOT / "hotwords.txt"
 LOG_DIR = ROOT / "logs"
 LOG_FILE = LOG_DIR / "dictate.log"
 SR = 16000
 
 DEFAULT_CONFIG = {
-    "hotkey_keycode": 61,  # 右 Option
-    "hotkey_name": "右 Option",
+    "hotkey_keycode": 58,  # 左 Option
+    "hotkey_name": "左 Option",
     "auto_enter": False,
     "restore_clipboard": True,
     "model": "models/Qwen3-ASR-0.6B",
@@ -133,7 +134,9 @@ def setup_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            RotatingFileHandler(
+                LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+            ),
             logging.StreamHandler(sys.stdout),
         ],
     )
@@ -153,6 +156,32 @@ def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+
+
+def load_context(extra: str = "") -> str:
+    """热词来自 hotwords.txt，按空格拼接（Qwen3-ASR 的 context 格式）。"""
+    terms: list[str] = []
+    if HOTWORDS_FILE.exists():
+        for line in HOTWORDS_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                terms.append(line)
+    if extra:
+        terms.extend(extra.split())
+    return " ".join(dict.fromkeys(terms))
+
+
+def strip_context_echo(text: str, context: str) -> str:
+    """流式解码的第一块偶尔会把 context 原样吐出来，这里去掉。"""
+    text = (text or "").strip()
+    context = (context or "").strip()
+    if not text or not context:
+        return text
+    if text.startswith(context):
+        return text[len(context) :].lstrip(" ，。,.、")
+    if len(text) < len(context) and context.startswith(text):
+        return ""
+    return text
 
 
 def key_name(keycode: int) -> str:
@@ -439,12 +468,11 @@ class HotkeyTap:
         self.on_release = on_release
         self.on_cancel = on_cancel
         self.on_bind = on_bind
-        self.keycode = 61
+        self.keycode = 58
         self.learning = False
         self.down = False
         self.tap = None
         self._thread = None
-        self.debug_until = 0.0
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -481,7 +509,7 @@ class HotkeyTap:
         if flags & mask:
             return True
         # 个别键盘/系统不会在 flags 里给设备相关位（低 16 位），
-        # 此时退回通用修饰键位，否则右 Option 永远判不出按下。
+        # 此时退回通用修饰键位，否则修饰键永远判不出按下。
         generic = GENERIC_MODIFIER_MASKS.get(keycode)
         if generic and not (flags & 0xFFFF):
             return bool(flags & generic)
@@ -493,14 +521,6 @@ class HotkeyTap:
                 event, Quartz.kCGKeyboardEventKeycode
             )
         )
-
-        if time.time() < self.debug_until:
-            logging.info(
-                "按键调试：type=%s keycode=%s flags=0x%x",
-                event_type,
-                keycode,
-                int(Quartz.CGEventGetFlags(event)),
-            )
 
         if self.learning:
             if event_type == Quartz.kCGEventFlagsChanged:
@@ -706,7 +726,6 @@ class DictateApp(rumps.App):
             self.restore_item,
             None,
             rumps.MenuItem("检查权限…", callback=self.check_permissions),
-            rumps.MenuItem("按键调试（10 秒）…", callback=self.debug_keys),
             rumps.MenuItem("测试悬浮窗", callback=self.test_hud),
             rumps.MenuItem("打开日志", callback=self.open_log),
             rumps.MenuItem("退出", callback=self.quit),
@@ -739,7 +758,6 @@ class DictateApp(rumps.App):
 
     def load_model(self) -> None:
         from mlx_qwen3_asr import Session
-        from demo import load_context
 
         model = self.cfg.get("model", DEFAULT_CONFIG["model"])
         model_path = Path(model)
@@ -855,7 +873,6 @@ class DictateApp(rumps.App):
         self.stream_thread = None
 
     def _stream_worker(self, q: queue.Queue, stop: threading.Event) -> None:
-        from demo import strip_context_echo
         from mlx_qwen3_asr import streaming as st
 
         chunk_len = int(0.6 * SR)
@@ -984,8 +1001,6 @@ class DictateApp(rumps.App):
                 result = self.session.transcribe(
                     pcm, context=self.context, verbose=False
                 )
-                from demo import strip_context_echo
-
                 text = strip_context_echo(
                     getattr(result, "text", "") or "", self.context
                 )
@@ -1046,18 +1061,6 @@ class DictateApp(rumps.App):
         ui_thread(show)
         self._hud_hide_later(3.0, gen)
 
-    def debug_keys(self, _sender) -> None:
-        self.tap.debug_until = time.time() + 10
-        logging.info("开始按键调试：10 秒内会记录所有键盘事件")
-        self._set_state("idle", "按键调试：10 秒内随便按几个键")
-        ui_thread(
-            lambda: rumps.alert(
-                "按键调试",
-                "接下来 10 秒内按几下键盘（包括右 Option），"
-                "结果会写进 logs/dictate.log。",
-            )
-        )
-
     def check_permissions(self, _sender) -> None:
         trusted = AXIsProcessTrusted()
         monitoring = input_monitoring_status()
@@ -1085,18 +1088,6 @@ class DictateApp(rumps.App):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Qwen3-ASR 全局听写")
-    parser.add_argument("--list-devices", action="store_true", help="列出输入设备")
-    parser.add_argument("--device", default=None, help="输入设备 index 或名称")
-    parser.add_argument("--transcribe", default=None, help="只转写一个音频文件（不开界面）")
-    args = parser.parse_args()
-
-    if args.list_devices:
-        from demo import print_devices
-
-        print_devices()
-        return
-
     if os_import_error is not None:
         sys.exit(f"缺少 macOS 依赖：{os_import_error}")
 
@@ -1104,27 +1095,6 @@ def main() -> None:
     cfg = load_config()
     if not CONFIG_FILE.exists():
         save_config(cfg)
-    if args.device is not None:
-        cfg["device"] = args.device
-        save_config(cfg)
-
-    if args.transcribe:
-        from demo import load_context, strip_context_echo, to_wav
-        from mlx_qwen3_asr import Session, load_audio
-
-        model_path = Path(cfg["model"])
-        if not model_path.is_absolute():
-            model_path = ROOT / model_path
-        session = Session(str(model_path))
-        context = load_context()
-        path = to_wav(Path(args.transcribe).expanduser())
-        pcm = np.asarray(load_audio(str(path), sr=SR), dtype=np.float32)
-        started = time.perf_counter()
-        result = session.transcribe(pcm, context=context, verbose=False)
-        text = strip_context_echo(getattr(result, "text", "") or "", context)
-        print(text)
-        print(f"耗时 {time.perf_counter() - started:.2f}s", file=sys.stderr)
-        return
 
     logging.info("启动 Dictate，热键 %s", key_name(int(cfg["hotkey_keycode"])))
     app = DictateApp(cfg)

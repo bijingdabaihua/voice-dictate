@@ -14,10 +14,13 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import ctypes
 import json
 import logging
+import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -26,6 +29,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import numpy as np
+import objc
 import rumps
 
 os_import_error = None
@@ -35,20 +39,28 @@ try:
         NSApplication,
         NSApplicationActivationPolicyAccessory,
         NSBackingStoreBuffered,
+        NSBezelStyleRounded,
+        NSButton,
         NSColor,
+        NSEvent,
+        NSFloatingWindowLevel,
         NSFont,
         NSFontAttributeName,
-        NSFloatingWindowLevel,
         NSImage,
         NSLineBreakByWordWrapping,
         NSMakeRect,
+        NSObject,
         NSOperationQueue,
         NSPanel,
         NSPasteboard,
         NSPasteboardItem,
         NSPasteboardTypeString,
+        NSProgressIndicator,
+        NSProgressIndicatorStyleBar,
         NSScreen,
         NSSound,
+        NSString,
+        NSStringDrawingUsesLineFragmentOrigin,
         NSTextAlignmentLeft,
         NSTextField,
         NSView,
@@ -57,23 +69,29 @@ try:
         NSWindowCollectionBehaviorIgnoresCycle,
         NSWindowCollectionBehaviorTransient,
         NSWindowStyleMaskBorderless,
+        NSWindowStyleMaskClosable,
         NSWindowStyleMaskNonactivatingPanel,
-        NSString,
-        NSStringDrawingUsesLineFragmentOrigin,
+        NSWindowStyleMaskTitled,
     )
     from ApplicationServices import (
         AXIsProcessTrusted,
         AXIsProcessTrustedWithOptions,
         kAXTrustedCheckOptionPrompt,
     )
-except Exception as exc:  # noqa: BLE001
+except Exception as exc:
     os_import_error = exc
 
-ROOT = Path(__file__).resolve().parent
-CONFIG_FILE = ROOT / "dictation.json"
-HOTWORDS_FILE = ROOT / "hotwords.txt"
-LOG_DIR = ROOT / "logs"
+APP_NAME = "Dictate"
+VERSION = "0.1.0"
+APP_SUPPORT = Path.home() / "Library" / "Application Support" / APP_NAME
+LOG_DIR = Path.home() / "Library" / "Logs" / APP_NAME
+MODELS_DIR = APP_SUPPORT / "models"
+CONFIG_FILE = APP_SUPPORT / "config.json"
+HOTWORDS_FILE = APP_SUPPORT / "hotwords.txt"
 LOG_FILE = LOG_DIR / "dictate.log"
+
+# 旧版把配置放在项目目录里；首次启动时迁移，避免用户丢配置。
+LEGACY_ROOT = Path(__file__).resolve().parent
 SR = 16000
 
 DEFAULT_CONFIG = {
@@ -82,10 +100,25 @@ DEFAULT_CONFIG = {
     "auto_enter": False,
     "restore_clipboard": True,
     "mute_audio": True,
-    "model": "models/Qwen3-ASR-0.6B",
+    "model": "Qwen3-ASR-0.6B",
+    "language": "Chinese",  # 强制输出中文，见 config_language()
     "device": None,
     "max_record_seconds": 60,
+    "log_transcriptions": False,  # 默认不把识别正文写进日志
+    "first_run_completed": False,
 }
+
+DEFAULT_HOTWORDS = """# 每行一个热词 / 专有名词，会作为 context 传给 Qwen3-ASR。
+#
+# 注意：不是越多越好。只放「模型容易听错」的专有名词；
+# Python / API / GitHub 这类常见词模型本来就认识，加多了反而会干扰
+# 流式解码（实测长列表会让 debug 被识别成「开发」）。
+Claude Code
+MCP
+"""
+
+# language 设为这些值时交给模型自动判断。
+LANGUAGE_AUTO = {"", "auto", "none", "null", "detect"}
 
 # 修饰键 keycode -> (名称, 设备相关 flag)
 MODIFIER_KEYS = {
@@ -131,8 +164,164 @@ KEY_RETURN = 36
 KEY_ESC = 53
 
 
+def ensure_app_dirs() -> None:
+    APP_SUPPORT.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def legacy_candidates(name: str) -> list[Path]:
+    """旧版文件可能在工作目录或脚本目录（仓库根/旧 App 资源目录）。"""
+    return [
+        Path.cwd() / name,
+        LEGACY_ROOT / name,
+        LEGACY_ROOT.parent / name,
+    ]
+
+
+def migrate_legacy_files() -> None:
+    """把仓库里的 dictation.json / hotwords.txt 迁移到 Application Support。"""
+    ensure_app_dirs()
+    if not CONFIG_FILE.exists():
+        for candidate in legacy_candidates("dictation.json"):
+            if candidate.is_file():
+                shutil.copy2(candidate, CONFIG_FILE)
+                try:
+                    old = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                    old.setdefault("first_run_completed", True)
+                    save_config(old)
+                except Exception:
+                    logging.exception("迁移旧配置时补全字段失败")
+                logging.info("已迁移旧配置：%s -> %s", candidate, CONFIG_FILE)
+                break
+        else:
+            save_config(dict(DEFAULT_CONFIG))
+    if not HOTWORDS_FILE.exists():
+        for candidate in legacy_candidates("hotwords.txt"):
+            if candidate.is_file():
+                shutil.copy2(candidate, HOTWORDS_FILE)
+                break
+        else:
+            HOTWORDS_FILE.write_text(DEFAULT_HOTWORDS, encoding="utf-8")
+
+
+def resolve_model_path(value: str) -> Path:
+    """把配置里的模型值解析成实际目录。
+
+    兼容旧配置的 "models/Qwen3-ASR-0.6B"，也优先使用 Application Support
+    里新下载的模型，最后才回退到仓库里的 models/。
+    """
+    raw = Path(os.path.expanduser(str(value)))
+    if raw.is_absolute():
+        return raw
+    name = raw.name
+    candidates = [MODELS_DIR / raw, MODELS_DIR / name]
+    for legacy in (str(raw), f"models/{name}"):
+        candidates.extend(legacy_candidates(legacy))
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+    return MODELS_DIR / name
+
+
+def model_ready(path: Path) -> bool:
+    return (path / "config.json").is_file() and any(path.glob("*.safetensors"))
+
+
+MODEL_REPO = "Qwen/Qwen3-ASR-0.6B"
+MODEL_FILES = (
+    "config.json",
+    "generation_config.json",
+    "model.safetensors",
+    "preprocessor_config.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "chat_template.json",
+)
+
+
+def model_endpoint() -> str:
+    return os.environ.get("HF_ENDPOINT", "").strip() or "https://hf-mirror.com"
+
+
+def _retry_download(fn, label: str, attempts: int = 3):
+    """镜像偶尔返回 429/5xx；等待后重试，尊重 Retry-After。"""
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt == attempts - 1:
+                raise
+            wait = min(30, 2**attempt)
+            response = getattr(exc, "response", None)
+            if response is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    wait = max(wait, min(60, int(response.headers.get("Retry-After", 0))))
+            logging.warning(
+                "%s失败（%s），%d 秒后重试（%d/%d）",
+                label,
+                exc,
+                wait,
+                attempt + 1,
+                attempts,
+            )
+            time.sleep(wait)
+
+
+def download_model(dest: Path, progress=None) -> None:
+    """下载 Qwen3-ASR 到 dest，progress(done, total, filename) 在下载线程里调用。"""
+    from huggingface_hub import HfApi, hf_hub_download
+    from tqdm.auto import tqdm
+
+    endpoint = model_endpoint()
+    logging.info("下载模型 %s -> %s（endpoint=%s）", MODEL_REPO, dest, endpoint)
+    api = HfApi(endpoint=endpoint)
+    info = _retry_download(
+        lambda: api.model_info(MODEL_REPO, files_metadata=True),
+        "获取模型信息",
+    )
+    sizes = {s.rfilename: int(s.size or 0) for s in info.siblings}
+    files = [name for name in MODEL_FILES if name in sizes]
+    if "model.safetensors" not in files:
+        raise RuntimeError("模型仓库里没有找到 model.safetensors")
+    total = sum(sizes[name] for name in files)
+    dest.mkdir(parents=True, exist_ok=True)
+    done = 0
+    if progress:
+        progress(0, total, "")
+
+    for filename in files:
+        class _Bar(tqdm):
+            def update(inner, n=1, base=done, name=filename):
+                out = tqdm.update(inner, n)
+                if progress:
+                    try:
+                        progress(min(base + (inner.n or 0), total), total, name)
+                    except Exception:
+                        logging.exception("更新下载进度失败")
+                return out
+
+        _retry_download(
+            lambda name=filename, bar=_Bar: hf_hub_download(
+                repo_id=MODEL_REPO,
+                filename=name,
+                local_dir=str(dest),
+                endpoint=endpoint,
+                tqdm_class=bar,
+            ),
+            f"下载 {filename}",
+        )
+        done += sizes[filename]
+        if progress:
+            progress(min(done, total), total, filename)
+
+    if not model_ready(dest):
+        raise RuntimeError("模型下载完成但校验失败")
+    logging.info("模型下载完成：%s", dest)
+
+
 def setup_logging() -> None:
-    LOG_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -150,15 +339,32 @@ def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logging.warning("读取配置失败，使用默认值：%s", exc)
     return cfg
 
 
 def save_config(cfg: dict) -> None:
-    CONFIG_FILE.write_text(
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+    tmp.write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    tmp.replace(CONFIG_FILE)
+
+
+def config_language(cfg: dict) -> str | None:
+    """读取输出语言；None 表示让模型自动判断。
+
+    Qwen3-ASR 按语言标签决定输出语言：自动判断时，一段中文只要被误判成
+    英文，模型就会输出英文译文（流式字幕尤其容易，因为每个窗口都会重新
+    判断）。中文听写默认强制 Chinese，避免整段变成英文。
+    """
+    value = cfg.get("language", DEFAULT_CONFIG["language"])
+    if value is None:
+        return None
+    text = str(value).strip()
+    return None if text.casefold() in LANGUAGE_AUTO else text
 
 
 def load_context(extra: str = "") -> str:
@@ -195,7 +401,7 @@ def to_simplified(text: str) -> str:
         return NSString.stringWithString_(text).stringByApplyingTransform_reverse_(
             "Traditional-Simplified", False
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         return text
 
 
@@ -215,7 +421,7 @@ def input_monitoring_status() -> str:
         iokit.IOHIDCheckAccess.restype = ctypes.c_uint32
         access = iokit.IOHIDCheckAccess(1)  # kIOHIDRequestTypeListenEvent
         return {0: "已授权", 1: "被拒绝", 2: "未决定"}.get(access, f"未知({access})")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return f"检查失败：{exc}"
 
 
@@ -228,8 +434,45 @@ def request_input_monitoring() -> None:
         iokit.IOHIDRequestAccess.argtypes = [ctypes.c_uint32]
         iokit.IOHIDRequestAccess.restype = ctypes.c_bool
         iokit.IOHIDRequestAccess(1)  # kIOHIDRequestTypeListenEvent
-    except Exception:  # noqa: BLE001
+    except Exception:
         logging.exception("请求输入监控权限失败")
+
+
+def microphone_status() -> str:
+    """查询麦克风权限（AVFoundation）。"""
+    try:
+        from AVFoundation import AVCaptureDevice, AVMediaTypeAudio
+
+        status = AVCaptureDevice.authorizationStatusForMediaType_(AVMediaTypeAudio)
+        return {
+            0: "未决定",
+            1: "受限",
+            2: "已拒绝",
+            3: "已授权",
+        }.get(status, f"未知({status})")
+    except Exception:
+        return "未知"
+
+
+def request_microphone() -> None:
+    try:
+        from AVFoundation import AVCaptureDevice, AVMediaTypeAudio
+
+        AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+            AVMediaTypeAudio, lambda _granted: None
+        )
+    except Exception:
+        logging.exception("请求麦克风权限失败")
+
+
+def open_privacy_settings(pane: str) -> None:
+    """打开系统设置的隐私面板。pane: Microphone / Accessibility / ListenEvent。"""
+    subprocess.Popen(
+        [
+            "open",
+            f"x-apple.systempreferences:com.apple.preference.security?Privacy_{pane}",
+        ]
+    )
 
 
 def ui_thread(fn) -> None:
@@ -242,17 +485,15 @@ def ui_thread(fn) -> None:
     def wrapped():
         try:
             fn()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logging.exception("UI 回调执行失败")
 
     NSOperationQueue.mainQueue().addOperationWithBlock_(wrapped)
 
 
 def play_sound(name: str) -> None:
-    try:
+    with contextlib.suppress(Exception):
         NSSound.soundNamed_(name).play()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -307,10 +548,10 @@ class AudioSilencer:
             ]
             ca.AudioObjectSetPropertyData.restype = ctypes.c_int32
             self._ca = ca
-        except Exception:  # noqa: BLE001
+        except Exception:
             logging.exception("加载 CoreAudio 失败，静音功能不可用")
 
-    def _addr(self, selector: int, scope: int) -> "AudioSilencer._Addr":
+    def _addr(self, selector: int, scope: int) -> AudioSilencer._Addr:
         return self._Addr(selector, scope, 0)
 
     def _default_device(self) -> int | None:
@@ -380,11 +621,28 @@ class AudioSilencer:
 class HUDWindow(NSPanel):
     """不抢焦点的浮窗。"""
 
-    def canBecomeKeyWindow(self):  # noqa: N802
+    def canBecomeKeyWindow(self):
         return False
 
-    def canBecomeMainWindow(self):  # noqa: N802
+    def canBecomeMainWindow(self):
         return False
+
+
+def active_screen():
+    """鼠标所在屏幕；多显示器时 HUD 跟着当前屏幕走。"""
+    screen = NSScreen.mainScreen()
+    try:
+        point = NSEvent.mouseLocation()
+        for candidate in NSScreen.screens():
+            frame = candidate.frame()
+            if (
+                frame.origin.x <= point.x < frame.origin.x + frame.size.width
+                and frame.origin.y <= point.y < frame.origin.y + frame.size.height
+            ):
+                return candidate
+    except Exception:
+        logging.debug("获取当前屏幕失败", exc_info=True)
+    return screen
 
 
 class HUD:
@@ -402,7 +660,7 @@ class HUD:
 
     def _build(self) -> None:
         width, height = self.WIDTH, self.BASE_HEIGHT
-        screen = NSScreen.mainScreen().visibleFrame()
+        screen = active_screen().visibleFrame()
         x = screen.origin.x + (screen.size.width - width) / 2
         y = screen.origin.y + 140
 
@@ -483,7 +741,7 @@ class HUD:
             NSStringDrawingUsesLineFragmentOrigin,
             attrs,
         )
-        measured = max(int(round(rect.size.height)), self.LINE_HEIGHT)
+        measured = max(round(rect.size.height), self.LINE_HEIGHT)
         return min(measured, self.LINE_HEIGHT * self.MAX_LINES)
 
     def _layout(self, text: str) -> None:
@@ -547,7 +805,7 @@ class Recorder:
             self.chunks = []
         self.started_at = time.perf_counter()
 
-        def callback(indata, frames, time_info, status):  # noqa: ANN001
+        def callback(indata, frames, time_info, status):
             if status:
                 logging.warning("音频状态：%s", status)
             block = indata[:, 0].copy()
@@ -556,18 +814,51 @@ class Recorder:
             if self.on_block is not None:
                 try:
                     self.on_block(block)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logging.exception("处理音频块失败")
 
-        self.stream = sd.InputStream(
-            samplerate=SR,
-            channels=1,
-            dtype="float32",
-            blocksize=int(0.05 * SR),
-            device=self.device,
-            callback=callback,
-        )
+        self.stream = self._open_stream(sd, callback)
         self.stream.start()
+
+    def _open_stream(self, sd, callback):
+        """打开输入流；失败时重新初始化 PortAudio 再试一次。
+
+        macOS 睡眠唤醒或音频设备热插拔后，PortAudio 的设备列表可能已经
+        失效，表现为 -9986（paInternalError）。以前只能重启 App；这里
+        主动 terminate/initialize，把陈旧状态清掉。
+        """
+        try:
+            info = sd.query_devices(kind="input")
+            logging.info(
+                "使用麦克风：%s（默认采样率 %s）",
+                info["name"],
+                info["default_samplerate"],
+            )
+        except Exception:
+            logging.debug("读取默认麦克风信息失败", exc_info=True)
+
+        last_error = None
+        for attempt in range(2):
+            try:
+                return sd.InputStream(
+                    samplerate=SR,
+                    channels=1,
+                    dtype="float32",
+                    blocksize=int(0.05 * SR),
+                    device=self.device,
+                    callback=callback,
+                )
+            except sd.PortAudioError as exc:
+                last_error = exc
+                logging.warning("打开麦克风失败（第 %d 次）：%s", attempt + 1, exc)
+                if attempt == 0:
+                    try:
+                        sd._terminate()
+                        sd._initialize()
+                        logging.info("已重新初始化音频系统，正在重试")
+                    except Exception:
+                        logging.exception("重新初始化音频系统失败")
+        raise last_error  # type: ignore[misc]
 
     def stop(self) -> np.ndarray:
         stream = self.stream
@@ -576,7 +867,7 @@ class Recorder:
             try:
                 stream.stop()
                 stream.close()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logging.warning("关闭音频流失败：%s", exc)
         with self.lock:
             chunks = list(self.chunks)
@@ -681,17 +972,16 @@ class HotkeyTap:
 
         # 非修饰键：keyDown/keyUp 就是按住/松开
         if keycode != self.keycode:
-            if event_type == Quartz.kCGEventKeyDown and keycode == KEY_ESC:
+            is_cancel = event_type == Quartz.kCGEventKeyDown and keycode == KEY_ESC
+            if is_cancel:
                 self.on_cancel()
             return
-        if event_type == Quartz.kCGEventKeyDown:
-            if not self.down:
-                self.down = True
-                self.on_press()
-        elif event_type == Quartz.kCGEventKeyUp:
-            if self.down:
-                self.down = False
-                self.on_release()
+        if event_type == Quartz.kCGEventKeyDown and not self.down:
+            self.down = True
+            self.on_press()
+        elif event_type == Quartz.kCGEventKeyUp and self.down:
+            self.down = False
+            self.on_release()
 
     def _run(self) -> None:
         mask = (
@@ -724,7 +1014,7 @@ class HotkeyTap:
             logging.info("全局热键监听已启动（keycode=%s）", self.keycode)
             Quartz.CFRunLoopRun()
 
-    def _callback(self, proxy, event_type, event, refcon):  # noqa: ANN001
+    def _callback(self, proxy, event_type, event, refcon):
         if event_type in (
             Quartz.kCGEventTapDisabledByTimeout,
             Quartz.kCGEventTapDisabledByUserInput,
@@ -735,7 +1025,7 @@ class HotkeyTap:
             return event
         try:
             self._handle(event_type, event)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logging.exception("处理键盘事件失败")
         return event
 
@@ -799,6 +1089,7 @@ def paste_text(text: str, restore: bool, auto_enter: bool) -> bool:
 
     pb.clearContents()
     pb.setString_forType_(text, NSPasteboardTypeString)
+    expected_change = pb.changeCount()
     time.sleep(0.02)
     post_key(KEY_V, command=True)
     if auto_enter:
@@ -806,8 +1097,313 @@ def paste_text(text: str, restore: bool, auto_enter: bool) -> bool:
         post_key(KEY_RETURN)
     if restore and trusted:
         time.sleep(0.45)
-        restore_pasteboard(pb, saved)
+        if pb.changeCount() == expected_change:
+            restore_pasteboard(pb, saved)
+        else:
+            # 这 0.45 秒里用户自己复制了新内容，别再把它覆盖掉。
+            logging.info("剪贴板已被其他程序修改，保留新内容")
     return trusted
+
+
+# ---------------------------------------------------------------------------
+# 首次运行 / 设置向导
+# ---------------------------------------------------------------------------
+
+class SetupWindow(NSObject):
+    """一个极简的设置窗口：模型下载 + 三项权限状态。"""
+
+    def initWithApp_(self, app):
+        self = objc.super(SetupWindow, self).init()
+        if self is None:
+            return None
+        self.app = app
+        self.window = None
+        self.fields = {}
+        self.downloading = False
+        self.model_path = resolve_model_path(
+            app.cfg.get("model", DEFAULT_CONFIG["model"])
+        )
+        return self
+
+    @objc.python_method
+    def _label(self, text, frame, size=13, bold=False, secondary=False, wrap=False):
+        label = NSTextField.alloc().initWithFrame_(frame)
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        label.setFont_(
+            NSFont.boldSystemFontOfSize_(size)
+            if bold
+            else NSFont.systemFontOfSize_(size)
+        )
+        label.setTextColor_(
+            NSColor.secondaryLabelColor() if secondary else NSColor.labelColor()
+        )
+        if wrap:
+            label.setLineBreakMode_(NSLineBreakByWordWrapping)
+            label.setUsesSingleLineMode_(False)
+            label.cell().setWraps_(True)
+        label.setStringValue_(text)
+        return label
+
+    @objc.python_method
+    def _button(self, title, frame, action, enabled=True):
+        button = NSButton.alloc().initWithFrame_(frame)
+        button.setTitle_(title)
+        button.setBezelStyle_(NSBezelStyleRounded)
+        button.setTarget_(self)
+        button.setAction_(action)
+        button.setEnabled_(enabled)
+        return button
+
+    @objc.python_method
+    def _build(self):
+        rect = NSMakeRect(0, 0, 560, 480)
+        panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect,
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+            NSBackingStoreBuffered,
+            False,
+        )
+        panel.setTitle_("Dictate 设置")
+        panel.setReleasedWhenClosed_(False)
+        panel.center()
+
+        content = NSView.alloc().initWithFrame_(rect)
+        panel.setContentView_(content)
+
+        content.addSubview_(
+            self._label("欢迎使用 Dictate", NSMakeRect(28, 424, 504, 30), 22, bold=True)
+        )
+        content.addSubview_(
+            self._label(
+                "按住左 Option 说话，松开后文字自动出现在光标处。"
+                "开始前先完成模型下载和三项系统权限。",
+                NSMakeRect(28, 376, 504, 40),
+                13,
+                secondary=True,
+                wrap=True,
+            )
+        )
+
+        content.addSubview_(
+            self._label("1. 语音模型", NSMakeRect(28, 340, 300, 18), 13, bold=True)
+        )
+        model_status = self._label(
+            "检查中…", NSMakeRect(28, 312, 370, 18), 13, secondary=True
+        )
+        content.addSubview_(model_status)
+        model_button = self._button(
+            "下载模型", NSMakeRect(408, 306, 120, 28), "downloadModel:"
+        )
+        content.addSubview_(model_button)
+
+        progress = NSProgressIndicator.alloc().initWithFrame_(
+            NSMakeRect(28, 290, 500, 8)
+        )
+        progress.setStyle_(NSProgressIndicatorStyleBar)
+        progress.setIndeterminate_(False)
+        progress.setMinValue_(0)
+        progress.setMaxValue_(100)
+        progress.setDoubleValue_(0)
+        progress.setHidden_(True)
+        content.addSubview_(progress)
+
+        content.addSubview_(
+            self._label("2. 系统权限", NSMakeRect(28, 254, 300, 18), 13, bold=True)
+        )
+
+        rows = [
+            ("麦克风", "mic_status", "请求权限", "openMicrophone:", 220),
+            ("辅助功能", "acc_status", "打开设置", "openAccessibility:", 186),
+            ("输入监控", "mon_status", "打开设置", "openInputMonitoring:", 152),
+        ]
+        for title, key, button_title, action, y in rows:
+            content.addSubview_(
+                self._label(title, NSMakeRect(28, y + 3, 120, 18), 13)
+            )
+            status = self._label(
+                "检查中…", NSMakeRect(150, y + 3, 230, 18), 13, secondary=True
+            )
+            content.addSubview_(status)
+            self.fields[key] = status
+            content.addSubview_(
+                self._button(button_title, NSMakeRect(390, y, 140, 28), action)
+            )
+
+        content.addSubview_(
+            self._label(
+                "授权后需要重启 Dictate 才会生效。辅助功能和输入监控是两个"
+                "独立列表，两个都要打开。",
+                NSMakeRect(28, 104, 504, 34),
+                11,
+                secondary=True,
+                wrap=True,
+            )
+        )
+
+        content.addSubview_(
+            self._button("稍后", NSMakeRect(28, 40, 80, 30), "later:")
+        )
+        content.addSubview_(
+            self._button("重新检查", NSMakeRect(120, 40, 100, 30), "recheck:")
+        )
+        content.addSubview_(
+            self._button("重启 App", NSMakeRect(300, 40, 100, 30), "restart:")
+        )
+        finish = self._button("完成", NSMakeRect(420, 40, 110, 30), "finish:")
+        finish.setEnabled_(False)
+        content.addSubview_(finish)
+
+        self.window = panel
+        self.fields.update(
+            {
+                "model_status": model_status,
+                "model_button": model_button,
+                "progress": progress,
+                "finish_button": finish,
+            }
+        )
+
+    @objc.python_method
+    def show(self):
+        if self.window is None:
+            self._build()
+        self.refresh()
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        self.window.makeKeyAndOrderFront_(None)
+
+    @objc.python_method
+    def refresh(self):
+        model_ok = model_ready(self.model_path)
+        mic = microphone_status()
+        acc = "已授权" if AXIsProcessTrusted() else "未授权"
+        mon = input_monitoring_status()
+
+        self.fields["model_status"].setStringValue_(
+            "已就绪" if model_ok else "未下载（约 1.8GB）"
+        )
+        self.fields["model_button"].setEnabled_(
+            not model_ok and not self.downloading
+        )
+        self.fields["mic_status"].setStringValue_(mic)
+        self.fields["acc_status"].setStringValue_(acc)
+        self.fields["mon_status"].setStringValue_(mon)
+
+        all_ok = (
+            model_ok
+            and mic in ("已授权", "未知")
+            and acc == "已授权"
+            and mon == "已授权"
+        )
+        self.fields["finish_button"].setEnabled_(all_ok)
+
+    @objc.python_method
+    def _schedule_refresh(self):
+        timer = threading.Timer(1.0, lambda: ui_thread(self.refresh))
+        timer.daemon = True
+        timer.start()
+
+    # -- 模型 ---------------------------------------------------------------
+    def downloadModel_(self, _sender):
+        if self.downloading:
+            return
+        if not self.app.confirm_model_download():
+            return
+        self.downloading = True
+        self.fields["model_button"].setEnabled_(False)
+        self.fields["model_button"].setTitle_("下载中…")
+        self.fields["progress"].setHidden_(False)
+        self.fields["progress"].setDoubleValue_(0)
+        self.fields["model_status"].setStringValue_("准备下载…")
+        threading.Thread(target=self._download_worker, daemon=True).start()
+
+    @objc.python_method
+    def _download_worker(self):
+        last_update = [0.0]
+
+        def on_progress(done, total, filename):
+            now = time.perf_counter()
+            if now - last_update[0] < 0.2 and done < total:
+                return
+            last_update[0] = now
+            percent = (done / total * 100.0) if total else 0.0
+            done_mb = done / (1024 * 1024)
+            total_mb = total / (1024 * 1024)
+
+            def update():
+                self.fields["progress"].setDoubleValue_(percent)
+                self.fields["model_status"].setStringValue_(
+                    f"下载中 {done_mb:.0f} / {total_mb:.0f} MB  {filename}"
+                )
+
+            ui_thread(update)
+
+        try:
+            download_model(self.model_path, on_progress)
+        except Exception as exc:
+            logging.exception("模型下载失败")
+            # 异常变量在 except 结束后会被删除，先绑定成普通局部变量再交给回调。
+            error = str(exc)
+            ui_thread(lambda: self._download_done(error))
+        else:
+            ui_thread(lambda: self._download_done(None))
+
+    @objc.python_method
+    def _download_done(self, error):
+        self.downloading = False
+        self.fields["model_button"].setTitle_("下载模型")
+        self.fields["progress"].setHidden_(True)
+        if error is not None:
+            self.fields["model_status"].setStringValue_(f"下载失败：{error}")
+            self.fields["model_button"].setEnabled_(True)
+            return
+        self.refresh()
+        self.app.reload_model()
+
+    # -- 权限 ---------------------------------------------------------------
+    def openMicrophone_(self, _sender):
+        if microphone_status() in ("已拒绝", "受限"):
+            open_privacy_settings("Microphone")
+        else:
+            request_microphone()
+        self._schedule_refresh()
+
+    def openAccessibility_(self, _sender):
+        open_privacy_settings("Accessibility")
+        self._schedule_refresh()
+
+    def openInputMonitoring_(self, _sender):
+        open_privacy_settings("ListenEvent")
+        self._schedule_refresh()
+
+    def recheck_(self, _sender):
+        self.refresh()
+        self._schedule_refresh()
+
+    def restart_(self, _sender):
+        self.app.restart()
+
+    def later_(self, _sender):
+        self.window.close()
+
+    def finish_(self, _sender):
+        self.refresh()
+        if not self.fields["finish_button"].isEnabled():
+            rumps.alert("还有项目未完成", "请先完成模型下载和三项权限授权。")
+            return
+        self.app.cfg["first_run_completed"] = True
+        save_config(self.app.cfg)
+        self.window.close()
+        self.app.reload_model()
+        if rumps.alert(
+            "设置完成",
+            "现在重启 Dictate 让权限生效吗？",
+            ok="重启",
+            cancel="稍后",
+        ):
+            self.app.restart()
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +1416,7 @@ class DictateApp(rumps.App):
         self.cfg = cfg
         self.session = None
         self.context = ""
+        self.language = config_language(cfg)
         self.state = "loading"  # loading / idle / recording / processing / error
         self.recorder = Recorder(device=cfg.get("device"))
         self.recorder.on_block = self._on_audio_block
@@ -839,6 +1436,7 @@ class DictateApp(rumps.App):
         self.stream_failed = False
         self._last_level = 0.0
         self.model_path_str = ""
+        self.setup_window = None
 
         self.status_item = rumps.MenuItem("模型加载中…")
         self.hotkey_item = rumps.MenuItem(
@@ -867,9 +1465,12 @@ class DictateApp(rumps.App):
             self.restore_item,
             self.mute_item,
             None,
+            rumps.MenuItem("设置向导…", callback=self.open_setup),
             rumps.MenuItem("检查权限…", callback=self.check_permissions),
+            rumps.MenuItem("编辑热词…", callback=self.edit_hotwords),
             rumps.MenuItem("测试悬浮窗", callback=self.test_hud),
             rumps.MenuItem("打开日志", callback=self.open_log),
+            rumps.MenuItem(f"关于 Dictate {VERSION}", callback=self.about),
             rumps.MenuItem("退出", callback=self.quit),
         ]
 
@@ -897,16 +1498,50 @@ class DictateApp(rumps.App):
         if not trusted:
             AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
             logging.warning("尚未获得辅助功能权限，已弹出系统授权提示")
+        if not self.cfg.get("first_run_completed", False) or not model_ready(
+            resolve_model_path(self.cfg.get("model", DEFAULT_CONFIG["model"]))
+        ):
+            ui_thread(self.open_setup)
+
+    def open_setup(self, _sender=None) -> None:
+        if self.setup_window is None:
+            self.setup_window = SetupWindow.alloc().initWithApp_(self)
+        self.setup_window.show()
+
+    def confirm_model_download(self) -> bool:
+        model_path = resolve_model_path(
+            self.cfg.get("model", DEFAULT_CONFIG["model"])
+        )
+        return bool(
+            rumps.alert(
+                "下载语音模型",
+                "首次使用需要下载约 1.8GB 的 Qwen3-ASR 模型。\n\n"
+                f"保存位置：{model_path}\n\n继续下载吗？",
+                ok="下载",
+                cancel="取消",
+            )
+        )
+
+    def reload_model(self) -> None:
+        if self.session is None:
+            threading.Thread(target=self.load_model, daemon=True).start()
+
+    def restart(self) -> None:
+        self._unsilence()
+        logging.info("重启 Dictate")
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     def load_model(self) -> None:
         from mlx_qwen3_asr import Session
 
         model = self.cfg.get("model", DEFAULT_CONFIG["model"])
-        model_path = Path(model)
-        if not model_path.is_absolute():
-            model_path = ROOT / model_path
+        model_path = resolve_model_path(model)
         started = time.perf_counter()
         logging.info("加载模型：%s", model_path)
+        if not model_ready(model_path):
+            logging.warning("模型未就绪：%s", model_path)
+            self._set_state("error", "缺少语音模型，请在菜单里打开设置向导")
+            return
         try:
             self.model_path_str = str(model_path)
             self.session = Session(str(model_path))
@@ -914,7 +1549,7 @@ class DictateApp(rumps.App):
             elapsed = time.perf_counter() - started
             logging.info("模型加载完成，耗时 %.2fs", elapsed)
             self._set_state("idle", f"就绪（模型加载 {elapsed:.1f}s）")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logging.exception("模型加载失败")
             self._set_state("error", f"模型加载失败：{exc}")
 
@@ -952,7 +1587,7 @@ class DictateApp(rumps.App):
             image.setSize_((17.0, 17.0))
             item.setImage_(image)
             self.title = ""  # 清掉文字，只留图标（此时已有 image，不会回退成名字）
-        except Exception:  # noqa: BLE001
+        except Exception:
             logging.exception("设置菜单栏图标失败")
             self.title = fallback
 
@@ -992,7 +1627,7 @@ class DictateApp(rumps.App):
             self._last_level = now
             rms = float(np.sqrt(np.mean(block**2) + 1e-12))
             level = "▁▂▃▄▅▆▇█"[min(7, int(rms * 120))]
-            ui_thread(lambda l=level: self.hud.set_status(f"● 正在听 {l}"))
+            ui_thread(lambda bar=level: self.hud.set_status(f"● 正在听 {bar}"))
 
     def _start_stream(self) -> None:
         self.stream_failed = False
@@ -1022,10 +1657,11 @@ class DictateApp(rumps.App):
             state = st.init_streaming(
                 model=self.model_path_str,
                 context=self.context,
+                language=self.language,
                 chunk_size_sec=0.6,
                 endpointing_mode="energy",
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logging.exception("实时字幕初始化失败")
             self.stream_failed = True
             ui_thread(lambda: self.hud.set_status("● 正在听（实时字幕不可用）"))
@@ -1043,7 +1679,7 @@ class DictateApp(rumps.App):
             while len(pending) >= chunk_len and not stop.is_set():
                 try:
                     state = st.feed_audio(pending[:chunk_len], state)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logging.exception("实时字幕解码失败")
                     self.stream_failed = True
                     ui_thread(
@@ -1091,13 +1727,18 @@ class DictateApp(rumps.App):
             return
         if self.session is None:
             play_sound("Basso")
-            self._set_state("loading", "模型还在加载，请稍等…")
+            if self.state == "error":
+                self._set_state("error", "模型未就绪，请从菜单打开设置向导")
+            else:
+                self._set_state("loading", "模型还在加载，请稍等…")
             return
+        # 热词可能在两次录音之间被编辑过，每次重新读一遍。
+        self.context = load_context()
         self._hud_show("● 正在听…")
         self._start_stream()
         try:
             self.recorder.start()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logging.exception("开始录音失败")
             self._stop_stream()
             ui_thread(self.hud.hide)
@@ -1120,7 +1761,7 @@ class DictateApp(rumps.App):
             self.record_timer = None
         try:
             pcm = self.recorder.stop()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logging.exception("停止录音失败")
             self._stop_stream()
             ui_thread(self.hud.hide)
@@ -1172,17 +1813,21 @@ class DictateApp(rumps.App):
         with self.transcribe_lock:
             try:
                 result = self.session.transcribe(
-                    pcm, context=self.context, verbose=False
+                    pcm,
+                    context=self.context,
+                    language=self.language,
+                    verbose=False,
                 )
                 text = to_simplified(
                     strip_context_echo(
                         getattr(result, "text", "") or "", self.context
                     )
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logging.exception("识别失败")
+                message = f"识别失败：{exc}"
                 ui_thread(self.hud.hide)
-                ui_thread(lambda: self._error(f"识别失败：{exc}"))
+                ui_thread(lambda: self._error(message))
                 return
         elapsed = time.perf_counter() - started
         gen = self.hud_gen
@@ -1192,7 +1837,10 @@ class DictateApp(rumps.App):
             self._hud_hide_later(0.8, gen)
             self._set_state("idle", "没有识别到内容")
             return
-        logging.info("识别完成 %.2fs：%s", elapsed, text)
+        if self.cfg.get("log_transcriptions", False):
+            logging.info("识别完成 %.2fs：%s", elapsed, text)
+        else:
+            logging.info("识别完成 %.2fs，%d 字", elapsed, len(text))
 
         ui_thread(lambda: self.hud.set_text(text))
         ui_thread(lambda: self.hud.set_status("✓ 已输入"))
@@ -1246,17 +1894,39 @@ class DictateApp(rumps.App):
     def check_permissions(self, _sender) -> None:
         trusted = AXIsProcessTrusted()
         monitoring = input_monitoring_status()
+        mic = microphone_status()
         detail = (
+            f"麦克风：{mic}\n"
             f"辅助功能：{'已授权' if trusted else '未授权'}\n"
             f"输入监控：{monitoring}\n\n"
         )
-        if not trusted or monitoring != "已授权":
+        if not trusted or monitoring != "已授权" or mic not in ("已授权", "未知"):
             detail += (
-                "请到 系统设置 → 隐私与安全性，分别在「辅助功能」和"
-                "「输入监控」里勾选 Dictate（或 Python），然后重启本程序。\n\n"
-                "注意这是两个不同的列表，只开辅助功能，热键仍然收不到按键。"
+                "请到 系统设置 → 隐私与安全性，分别在「麦克风」「辅助功能」和"
+                "「输入监控」里勾选 Dictate（从源码运行时可能是 Python），"
+                "然后重启本程序。\n\n"
+                "注意这是三个不同的列表，三个都要打开。"
             )
         rumps.alert("Dictate 权限", detail)
+
+    def edit_hotwords(self, _sender) -> None:
+        if not HOTWORDS_FILE.exists():
+            HOTWORDS_FILE.write_text(DEFAULT_HOTWORDS, encoding="utf-8")
+        subprocess.Popen(["open", "-t", str(HOTWORDS_FILE)])
+        rumps.alert(
+            "编辑热词",
+            "修改保存后，下一次录音会自动生效，不需要重启。",
+        )
+
+    def about(self, _sender) -> None:
+        rumps.alert(
+            f"Dictate {VERSION}",
+            "按住左 Option 说话，松开自动粘贴。\n\n"
+            "识别完全离线：Qwen3-ASR + MLX，录音不会离开这台 Mac。\n\n"
+            f"配置：{CONFIG_FILE}\n"
+            f"日志：{LOG_FILE}\n"
+            f"模型：{resolve_model_path(self.cfg.get('model', DEFAULT_CONFIG['model']))}",
+        )
 
     def open_log(self, _sender) -> None:
         subprocess.Popen(["open", "-e", str(LOG_FILE)])
@@ -1274,12 +1944,18 @@ def main() -> None:
     if os_import_error is not None:
         sys.exit(f"缺少 macOS 依赖：{os_import_error}")
 
+    ensure_app_dirs()
     setup_logging()
+    migrate_legacy_files()
     cfg = load_config()
-    if not CONFIG_FILE.exists():
-        save_config(cfg)
 
-    logging.info("启动 Dictate，热键 %s", key_name(int(cfg["hotkey_keycode"])))
+    logging.info(
+        "启动 Dictate %s（配置 %s，日志 %s）",
+        VERSION,
+        CONFIG_FILE,
+        LOG_FILE,
+    )
+    logging.info("热键 %s", key_name(int(cfg["hotkey_keycode"])))
     app = DictateApp(cfg)
     app.start()
     # 启动壳 exec 的是 Python.app，默认会被当成普通 GUI 程序，

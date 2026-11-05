@@ -4,14 +4,19 @@
 <dict>
   <key>CFBundleName</key><string>Dictate</string>
   <key>CFBundleDisplayName</key><string>Dictate</string>
-  <key>CFBundleIdentifier</key><string>local.dictate.qwen3asr</string>
+  <key>CFBundleIdentifier</key><string>io.github.bijingdabaihua.dictate</string>
   <key>CFBundleVersion</key><string>0.1.0</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>Dictate</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
   <key>LSUIElement</key><true/>
   <key>NSMicrophoneUsageDescription</key>
   <string>按住热键说话，把语音转成文字。</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © 2026 bijingdabaihua. MIT License.</string>
 </dict>
 </plist>

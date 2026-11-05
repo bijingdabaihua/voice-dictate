@@ -1,0 +1,15 @@
+# 自包含 App 的顶层依赖（由 packaging/build-app.sh 装入 App 包）
+# 只列直接依赖，传递依赖交给 pip 解析，避免锁死到某个 Python 小版本。
+mlx==0.32.4
+mlx-metal==0.32.4
+mlx-qwen3-asr==0.4.4
+numpy==2.5.4
+huggingface_hub==2.2.0
+tqdm==4.70.1
+rumps==0.4.0
+sounddevice==0.5.6
+pyobjc-core==12.2.2
+pyobjc-framework-ApplicationServices==12.2.2
+pyobjc-framework-AVFoundation==12.2.2
+pyobjc-framework-Cocoa==12.2.2
+pyobjc-framework-Quartz==12.2.2

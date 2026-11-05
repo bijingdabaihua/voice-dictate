@@ -1,0 +1,9 @@
+# 只用于 CI 的 lint/test；不安装 mlx 和模型运行时。
+numpy>=1.26
+rumps>=0.4
+pyobjc-core>=10
+pyobjc-framework-Cocoa>=10
+pyobjc-framework-Quartz>=10
+pyobjc-framework-ApplicationServices>=10
+ruff>=0.8
+pytest>=8

@@ -1231,7 +1231,7 @@ class SetupWindow(NSObject):
             NSBackingStoreBuffered,
             False,
         )
-        panel.setTitle_("Dictate 设置")
+        panel.setTitle_("Dictate 设置与权限")
         panel.setReleasedWhenClosed_(False)
         panel.center()
 
@@ -1239,12 +1239,12 @@ class SetupWindow(NSObject):
         panel.setContentView_(content)
 
         content.addSubview_(
-            self._label("欢迎使用 Dictate", NSMakeRect(28, 424, 504, 30), 22, bold=True)
+            self._label("Dictate 设置", NSMakeRect(28, 424, 504, 30), 22, bold=True)
         )
         content.addSubview_(
             self._label(
                 "按住左 Option 说话，松开后文字自动出现在光标处。"
-                "开始前先完成模型下载和三项系统权限。",
+                "模型和三项系统权限都就绪后，点「完成」。",
                 NSMakeRect(28, 376, 504, 40),
                 13,
                 secondary=True,
@@ -1554,10 +1554,15 @@ class DictateApp(rumps.App):
         self.tap.start()
         trusted = AXIsProcessTrusted()
         monitoring = input_monitoring_status()
+        mic = microphone_status()
         logging.info(
-            "权限状态：辅助功能=%s，输入监控=%s",
+            "权限状态：麦克风=%s，辅助功能=%s，输入监控=%s",
+            mic,
             "已授权" if trusted else "未授权",
             monitoring,
+        )
+        permissions_ok = (
+            mic in ("已授权", "未知") and trusted and monitoring == "已授权"
         )
         if monitoring != "已授权":
             request_input_monitoring()
@@ -1566,7 +1571,9 @@ class DictateApp(rumps.App):
             logging.warning("尚未获得辅助功能权限，已弹出系统授权提示")
         if not self.cfg.get("first_run_completed", False) or not model_ready(
             resolve_model_path(self.cfg.get("model", DEFAULT_CONFIG["model"]))
-        ):
+        ) or not permissions_ok:
+            if not permissions_ok:
+                logging.warning("系统权限不完整，打开设置向导")
             ui_thread(self.open_setup)
 
     def open_setup(self, _sender=None) -> None:

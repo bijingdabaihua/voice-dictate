@@ -54,6 +54,50 @@ def test_hud_clip_trims_and_keeps_tail():
     assert len(clipped) == dictate.HUD.MAX_CHARS + 1
 
 
+def test_pick_input_device_skips_output_only_devices():
+    devices = [
+        {"name": "扬声器", "max_input_channels": 0},
+        {"name": "EarPods Microphone", "max_input_channels": 1},
+    ]
+    index, info = dictate.pick_input_device(devices)
+    assert index == 1
+    assert info["name"] == "EarPods Microphone"
+
+
+def test_pick_input_device_none_when_no_input_hardware():
+    devices = [{"name": "扬声器", "max_input_channels": 0}]
+    assert dictate.pick_input_device(devices) == (None, None)
+    assert dictate.pick_input_device([]) == (None, None)
+
+
+def test_pick_input_device_prefers_configured_device():
+    devices = [
+        {"name": "内置麦克风", "max_input_channels": 1},
+        {"name": "USB 麦克风", "max_input_channels": 2},
+    ]
+    index, info = dictate.pick_input_device(devices, 0, preferred=1)
+    assert index == 1
+    assert info["name"] == "USB 麦克风"
+
+
+def test_pick_input_device_falls_back_when_configured_device_missing():
+    devices = [
+        {"name": "扬声器", "max_input_channels": 0},
+        {"name": "内置麦克风", "max_input_channels": 1},
+    ]
+    index, _ = dictate.pick_input_device(devices, -1, preferred=9)
+    assert index == 1
+
+
+def test_pick_input_device_falls_back_when_default_input_is_minus_one():
+    devices = [
+        {"name": "扬声器", "max_input_channels": 0},
+        {"name": "USB 麦克风", "max_input_channels": 1},
+    ]
+    index, _ = dictate.pick_input_device(devices, -1)
+    assert index == 1
+
+
 def test_retry_download_retries_transient_errors(monkeypatch):
     monkeypatch.setattr(dictate.time, "sleep", lambda _seconds: None)
     calls = []

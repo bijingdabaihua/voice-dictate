@@ -465,6 +465,41 @@ def request_microphone() -> None:
         logging.exception("请求麦克风权限失败")
 
 
+NO_MIC_MESSAGE = (
+    "未检测到麦克风。请连接耳机或 USB 麦克风，在「系统设置 → 声音 → 输入」"
+    "确认设备出现后重试。"
+)
+
+
+class MicrophoneUnavailable(RuntimeError):
+    """系统当前没有可用的音频输入设备。"""
+
+
+def pick_input_device(devices, default_input=None, preferred=None):
+    """从设备列表里选一个输入设备，返回 (index, info)；没有则 (None, None)。
+
+    优先用配置里指定的设备；找不到就退回系统默认输入；再不行用第一个有
+    输入通道的设备。系统默认输入可能是 -1，直接传给 PortAudio 会报
+    「Error querying device -1」，所以这里始终返回有效编号。
+    """
+    inputs = [
+        (index, info)
+        for index, info in enumerate(devices)
+        if int(info.get("max_input_channels") or 0) > 0
+    ]
+    if not inputs:
+        return None, None
+    if preferred is not None:
+        for index, info in inputs:
+            if index == preferred:
+                return index, info
+    if isinstance(default_input, int) and default_input >= 0:
+        for index, info in inputs:
+            if index == default_input:
+                return index, info
+    return inputs[0]
+
+
 def open_privacy_settings(pane: str) -> None:
     """打开系统设置的隐私面板。pane: Microphone / Accessibility / ListenEvent。"""
     subprocess.Popen(
@@ -820,44 +855,74 @@ class Recorder:
         self.stream = self._open_stream(sd, callback)
         self.stream.start()
 
+    def _choose_input(self, sd):
+        """重新查询设备列表，选一个当前可用的输入设备。"""
+        try:
+            devices = sd.query_devices()
+        except Exception as exc:
+            logging.warning("查询音频设备失败：%s", exc)
+            return None, None
+        try:
+            default_input = sd.default.device[0]
+        except Exception:
+            default_input = None
+        index, info = pick_input_device(devices, default_input, self.device)
+        if index is None:
+            logging.warning("系统当前没有可用的输入设备")
+            return None, None
+        if self.device is not None and index != self.device:
+            logging.warning("配置的输入设备 %s 不可用，改用设备 %s", self.device, index)
+        return index, info
+
     def _open_stream(self, sd, callback):
-        """打开输入流；失败时重新初始化 PortAudio 再试一次。
+        """打开输入流；设备失效时自动重连，连不上时给出明确提示。
 
         macOS 睡眠唤醒或音频设备热插拔后，PortAudio 的设备列表可能已经
-        失效，表现为 -9986（paInternalError）。以前只能重启 App；这里
-        主动 terminate/initialize，把陈旧状态清掉。
+        失效，表现为 -9986（paInternalError）。先直接重试一次，再重新
+        初始化 PortAudio。如果重初始化后系统里一个输入设备都没有，说明
+        是麦克风没连上，继续重试没有意义，直接报「未检测到麦克风」。
         """
-        try:
-            info = sd.query_devices(kind="input")
-            logging.info(
-                "使用麦克风：%s（默认采样率 %s）",
-                info["name"],
-                info["default_samplerate"],
-            )
-        except Exception:
-            logging.debug("读取默认麦克风信息失败", exc_info=True)
+        index, info = self._choose_input(sd)
+        if index is None:
+            raise MicrophoneUnavailable(NO_MIC_MESSAGE)
+        logging.info(
+            "使用麦克风：%s（设备 %d，默认采样率 %s）",
+            info.get("name", "未知"),
+            index,
+            info.get("default_samplerate", "未知"),
+        )
 
         last_error = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 return sd.InputStream(
                     samplerate=SR,
                     channels=1,
                     dtype="float32",
                     blocksize=int(0.05 * SR),
-                    device=self.device,
+                    device=index,
                     callback=callback,
                 )
             except sd.PortAudioError as exc:
                 last_error = exc
                 logging.warning("打开麦克风失败（第 %d 次）：%s", attempt + 1, exc)
                 if attempt == 0:
+                    # 先只重查设备，不做全局重初始化：热插拔后设备编号可能变了
+                    index, info = self._choose_input(sd)
+                    if index is None:
+                        raise MicrophoneUnavailable(NO_MIC_MESSAGE) from exc
+                    logging.info("重试使用麦克风：%s（设备 %d）", info.get("name"), index)
+                elif attempt == 1:
                     try:
                         sd._terminate()
                         sd._initialize()
                         logging.info("已重新初始化音频系统，正在重试")
                     except Exception:
                         logging.exception("重新初始化音频系统失败")
+                    index, info = self._choose_input(sd)
+                    if index is None:
+                        raise MicrophoneUnavailable(NO_MIC_MESSAGE) from exc
+                    logging.info("重试使用麦克风：%s（设备 %d）", info.get("name"), index)
         raise last_error  # type: ignore[misc]
 
     def stop(self) -> np.ndarray:
@@ -1467,6 +1532,7 @@ class DictateApp(rumps.App):
             None,
             rumps.MenuItem("设置向导…", callback=self.open_setup),
             rumps.MenuItem("检查权限…", callback=self.check_permissions),
+            rumps.MenuItem("重新连接麦克风", callback=self.reconnect_microphone),
             rumps.MenuItem("编辑热词…", callback=self.edit_hotwords),
             rumps.MenuItem("测试悬浮窗", callback=self.test_hud),
             rumps.MenuItem("打开日志", callback=self.open_log),
@@ -1738,6 +1804,12 @@ class DictateApp(rumps.App):
         self._start_stream()
         try:
             self.recorder.start()
+        except MicrophoneUnavailable as exc:
+            logging.warning("无法开始录音：%s", exc)
+            self._stop_stream()
+            ui_thread(self.hud.hide)
+            self._error(str(exc))
+            return
         except Exception as exc:
             logging.exception("开始录音失败")
             self._stop_stream()
@@ -1908,6 +1980,40 @@ class DictateApp(rumps.App):
                 "注意这是三个不同的列表，三个都要打开。"
             )
         rumps.alert("Dictate 权限", detail)
+
+    def reconnect_microphone(self, _sender) -> None:
+        """重新初始化音频系统并枚举输入设备；用于唤醒或热插拔后的异常。"""
+        if self.state == "recording":
+            rumps.alert("正在录音", "请先松开左 Option，再重新连接麦克风。")
+            return
+
+        def run():
+            try:
+                import sounddevice as sd
+
+                sd._terminate()
+                sd._initialize()
+                devices = sd.query_devices()
+                try:
+                    default_input = sd.default.device[0]
+                except Exception:
+                    default_input = None
+                index, info = pick_input_device(
+                    devices, default_input, self.cfg.get("device")
+                )
+            except Exception as exc:
+                logging.exception("重新连接麦克风失败")
+                message = f"重新连接麦克风失败：{exc}"
+                ui_thread(lambda: self._set_state("error", message))
+                return
+            if index is None:
+                ui_thread(lambda: self._error(NO_MIC_MESSAGE))
+                return
+            name = info.get("name", f"设备 {index}")
+            logging.info("重新连接麦克风成功：%s（设备 %d）", name, index)
+            ui_thread(lambda: self._set_state("idle", f"已连接麦克风：{name}"))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def edit_hotwords(self, _sender) -> None:
         if not HOTWORDS_FILE.exists():

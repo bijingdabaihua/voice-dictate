@@ -169,3 +169,18 @@ def test_resolve_model_path_returns_download_target_when_missing(tmp_path: Path,
     monkeypatch.chdir(tmp_path)
 
     assert dictate.resolve_model_path("Qwen3-ASR-1.7B") == models_dir / "Qwen3-ASR-1.7B"
+
+
+def test_escape_cancels_while_default_modifier_is_down(monkeypatch):
+    events = []
+    tap = dictate.HotkeyTap(
+        lambda: events.append("press"), lambda: events.append("release"),
+        lambda: events.append("cancel"), lambda code: None,
+    )
+    quartz = dictate.Quartz
+    monkeypatch.setattr(quartz, "CGEventGetIntegerValueField", lambda event, field: event[0])
+    monkeypatch.setattr(quartz, "CGEventGetFlags", lambda event: event[1])
+    tap._handle(quartz.kCGEventFlagsChanged, (58, dictate.MODIFIER_KEYS[58][1]))
+    tap._handle(quartz.kCGEventKeyDown, (dictate.KEY_ESC, 0))
+    tap._handle(quartz.kCGEventFlagsChanged, (58, 0))
+    assert events == ["press", "cancel", "release"]

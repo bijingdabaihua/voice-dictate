@@ -1022,6 +1022,10 @@ class HotkeyTap:
                 self.on_bind(keycode)
             return
 
+        if keycode == KEY_ESC and event_type == Quartz.kCGEventKeyDown and keycode != self.keycode:
+            self.on_cancel()
+            return
+
         if self._is_modifier(self.keycode):
             if event_type != Quartz.kCGEventFlagsChanged or keycode != self.keycode:
                 return
@@ -1037,9 +1041,6 @@ class HotkeyTap:
 
         # 非修饰键：keyDown/keyUp 就是按住/松开
         if keycode != self.keycode:
-            is_cancel = event_type == Quartz.kCGEventKeyDown and keycode == KEY_ESC
-            if is_cancel:
-                self.on_cancel()
             return
         if event_type == Quartz.kCGEventKeyDown and not self.down:
             self.down = True
@@ -1243,7 +1244,7 @@ class SetupWindow(NSObject):
         )
         content.addSubview_(
             self._label(
-                "按住左 Option 说话，松开后文字自动出现在光标处。"
+                "按住听写键说话，松开后文字就到光标处。听写键可在菜单栏重新绑定。"
                 "模型和三项系统权限都就绪后，点「完成」。",
                 NSMakeRect(28, 376, 504, 40),
                 13,
@@ -1991,7 +1992,7 @@ class DictateApp(rumps.App):
     def reconnect_microphone(self, _sender) -> None:
         """重新初始化音频系统并枚举输入设备；用于唤醒或热插拔后的异常。"""
         if self.state == "recording":
-            rumps.alert("正在录音", "请先松开左 Option，再重新连接麦克风。")
+            rumps.alert("正在录音", "请先松开听写键，再重新连接麦克风。")
             return
 
         def run():
@@ -2034,7 +2035,7 @@ class DictateApp(rumps.App):
     def about(self, _sender) -> None:
         rumps.alert(
             f"Dictate {VERSION}",
-            "按住左 Option 说话，松开自动粘贴。\n\n"
+            "按住听写键说话，松开自动粘贴。可在菜单栏重新绑定热键。\n\n"
             "识别完全离线：Qwen3-ASR + MLX，录音不会离开这台 Mac。\n\n"
             f"配置：{CONFIG_FILE}\n"
             f"日志：{LOG_FILE}\n"

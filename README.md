@@ -1,72 +1,31 @@
 # Dictate
 
-**按住左 Option 说话，松开就把文字粘贴到光标处。** 识别完全在本地，录音不上传。
+**Mac 上的本地听写键。按住自己选的键说话，松手，文字就到光标处。**
 
-基于 [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) + [MLX](https://github.com/ml-explore/mlx)，
-在 Apple Silicon 上离线完成语音识别。适合在 Claude Code、终端、浏览器、聊天窗口里代替键盘输入；
-中英混说和技术名词（可自定义热词）表现较好。
+给 Claude Code 或其他终端工具提需求时，可以直接说：“先别改代码，帮我看看为什么这个 API 会发两次请求。”Dictate 会在悬浮窗显示识别过程，松键后把结果粘贴到当前输入框。默认由你检查文字、按回车发送。
 
-https://github.com/bijingdabaihua/voice-dictate
+![Dictate 原生悬浮窗显示一次本机识别结果](assets/dictation-preview.png)
 
-## 特性
+**[下载 v0.1.0 安装包（DMG）](https://github.com/bijingdabaihua/voice-dictate/releases/download/v0.1.0/Dictate-0.1.0.dmg)** · [最新版本和校验文件](https://github.com/bijingdabaihua/voice-dictate/releases/latest) · [报告问题](https://github.com/bijingdabaihua/voice-dictate/issues)
 
-- **按住即说，松开即写**：左 Option 全局热键，不需要切换窗口
-- **本地识别**：模型跑在本机 GPU 上，录音和文字都不离开电脑
-- **流式字幕**：说话时屏幕底部实时显示识别结果，松开后自动粘贴
-- **中英混说**：默认强制中文输出，英文技术名词保持原样
-- **热词表**：把 `Claude Code`、`MCP` 这类容易听错的词交给模型
-- **听写时静音**：自动静音系统输出，避免音乐和视频盖住说话声
-- **不弄脏剪贴板**：粘贴后默认恢复原来的剪贴板内容
-- **原生小工具**：菜单栏 App，无 Dock 图标，无账号，无订阅
+适用于 **Apple Silicon Mac（M1 或更新）和 macOS 15 或更新版本**。安装包自带运行环境。首次联网下载约 1.8 GB 的 Qwen3-ASR 模型，之后由 MLX 在本机识别。
 
-## 系统要求
+## 第一次使用
 
-- Apple Silicon Mac（M1 / M2 / M3 / M4 及以上）
-- macOS 14 Sonoma 或更新版本
-- 首次启动需要联网下载模型（约 1.8 GB，默认走 hf-mirror 镜像）
-- 磁盘空间：App 约 340 MB，模型约 2 GB
+1. 打开 DMG，把 **Dictate** 拖进「应用程序」，从那里启动。当前版本未经 Apple 公证；若被拦截，可在「系统设置 → 隐私与安全性」中找到本次启动记录，选择「仍要打开」。
+2. 按向导下载模型，并开启 **麦克风**（录音）、**输入监控**（监听听写键）、**辅助功能**（粘贴文字）。如果提示重启，退出并重新打开 Dictate。
+3. 把光标放进终端、编辑器或聊天输入框。默认按住 **左 Option** 说话，松开后查看结果。
 
-Intel Mac 和 Windows 暂不支持。
+### 换成自己的听写键
 
-## 安装
+点击菜单栏的 Dictate 图标 → **重新绑定热键…** → 按一下想用的键。之后按住这个键开始听写，松开结束，选择会自动保存。支持单个普通键或常用修饰键，建议选不常用的一颗：普通键仍可能被当前应用接收。
 
-1. 到 [Releases](https://github.com/bijingdabaihua/voice-dictate/releases/latest) 下载
-   `Dictate-0.1.0.dmg`
-2. 打开 DMG，把 **Dictate** 拖进 **Applications**
-3. 从「应用程序」启动 Dictate
+### 日常使用
 
-> **首次打开被 macOS 拦截？**
-> 当前版本没有 Apple Developer ID 公证。到「系统设置 → 隐私与安全性」，
-> 在页面底部点「仍要打开」；或者在 Finder 里右键 App →「打开」。
-> 只需要做一次。
-
-国内访问 GitHub 较慢时，可以使用 Gitee 镜像：<https://gitee.com/bijingdabaihua/voice-dictate>（如未同步，请以 GitHub 为准）。
-
-## 首次启动
-
-App 会打开一个设置向导，按顺序完成三件事：
-
-1. **下载模型**：点「下载模型」，等待进度条走完（约 1.8 GB）
-2. **授权麦克风**：用于录音
-3. **授权辅助功能 + 输入监控**：辅助功能用于模拟 Cmd+V 粘贴，输入监控用于接收全局热键
-
-> 辅助功能和输入监控是 macOS 里**两个独立的列表**，两个都要打开。
-> 只开辅助功能时收不到热键；只开输入监控时能识别但粘贴不出去。
-
-授权完成后点「完成」。如果系统要求重启 App，菜单里有「重启 App」。
-
-模型和配置都在 `~/Library/Application Support/Dictate/`，日志在
-`~/Library/Logs/Dictate/dictate.log`。
-
-## 使用
-
-- 按住 **左 Option**（Windows 键盘上的左 Alt）说话，松开结束并粘贴
-- 录音时按 `Esc` 取消本次听写
-- 菜单栏图标状态：麦克风（就绪）/ 实心圆（录音中）/ 波形（识别中）/ 沙漏（加载中）/ 警告（出错）
-- 菜单里可以重新绑定热键、开关「说完自动回车」、开关「粘贴后恢复剪贴板」、
-  开关「听写时静音其他声音」、编辑热词、打开日志、重新运行设置向导
-
-识别结果会直接粘贴到当前光标处。如果当前窗口不支持 Cmd+V，文字仍会留在剪贴板里。
+- **取消本次听写**：按住听写键时按 Esc（听写键本身设为 Esc 时除外）。
+- **中英混说**：在菜单里点「编辑热词…」，加入容易听错的项目名或缩写，例如 Claude Code、MCP。
+- **粘贴与发送**：粘贴后默认恢复先前的剪贴板。菜单里可单独开启「说完自动回车」。
+- **隐私**：录音在内存中处理，Dictate 不上传音频，日志默认不写识别正文。
 
 ## 配置与热词
 
@@ -113,14 +72,6 @@ HF_ENDPOINT=https://hf-mirror.com .venv/bin/hf download \
 
 然后把 `config.json` 里的 `model` 改成 `"Qwen3-ASR-1.7B"`，重启 App。
 
-## 隐私
-
-- 录音只在内存里处理，不写入磁盘，不上传
-- 识别完全在本机完成；只有首次下载模型时会访问 Hugging Face 镜像
-- 日志默认**不记录**识别正文，只记录时长、字符数和错误信息
-- 需要排查问题时，可以在 `config.json` 里临时打开 `log_transcriptions`，
-  记得用完关掉
-
 ## 常见问题
 
 **热键没反应**
@@ -130,17 +81,7 @@ HF_ENDPOINT=https://hf-mirror.com .venv/bin/hf download \
 
 **为什么权限老是失效？**
 
-macOS 把麦克风、辅助功能、输入监控的授权和 App 的代码签名绑定。当前发布版是
-ad-hoc 签名，没有 Apple 开发者证书；每次重新构建或替换 App，签名都会变，
-系统就把它当成一个新 App，旧授权自动作废。
-
-- **日常使用**：把 Dictate 拖进 `/Applications`，只从那里启动。不要每次运行
-  `dist/` 里的副本，也不要频繁替换 App。授权一次后，重启电脑不会丢。
-- **更新版本**：替换 `/Applications/Dictate.app` 后需要重新授权一次。到
-  「系统设置 → 隐私与安全性」，把旧的 Dictate 条目用「−」删掉，再运行 App
-  重新授权。
-- **彻底解决**：使用 Apple Developer ID 签名并公证（每年 $99）。这样升级
-  不会掉权限，也不会再被 Gatekeeper 拦截。免费方案只能做到“不更新就不掉”。
+当前安装包使用临时签名。更新或替换应用后，macOS 可能要求重新授权。请从「应用程序」启动 Dictate，用菜单里的「检查权限」查看缺少哪一项；必要时在系统设置中移除旧条目，再为当前应用授权。
 
 **麦克风突然录不到声音**
 
@@ -170,8 +111,8 @@ ad-hoc 签名，没有 Apple 开发者证书；每次重新构建或替换 App�
 git clone https://github.com/bijingdabaihua/voice-dictate.git
 cd voice-dictate
 
-python3 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python dictate.py
 ```
 

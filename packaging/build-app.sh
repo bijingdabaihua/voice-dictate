@@ -61,6 +61,7 @@ cp -R "$BUILD/site-packages" "$APP/Contents/Resources/site-packages"
 
 # 3. 应用代码
 cp "$ROOT/dictate.py" "$APP/Contents/Resources/app/dictate.py"
+cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/"
 cp "$ROOT/packaging/Info.plist" "$APP/Contents/Info.plist"
 if [ -f "$ROOT/assets/AppIcon.icns" ]; then
   mkdir -p "$APP/Contents/Resources"
@@ -68,7 +69,7 @@ if [ -f "$ROOT/assets/AppIcon.icns" ]; then
 fi
 
 # 4. 启动壳
-clang -O2 -o "$APP/Contents/MacOS/Dictate" "$ROOT/packaging/launcher.c"
+clang -mmacosx-version-min=15.0 -O2 -o "$APP/Contents/MacOS/Dictate" "$ROOT/packaging/launcher.c"
 
 # 5. 清掉构建过程产生的缓存，避免把用户目录信息打进包
 find "$APP/Contents/Resources/site-packages" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
